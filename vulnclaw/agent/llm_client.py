@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from typing import Any
 
 from vulnclaw.agent.tool_call_manager import (
@@ -28,6 +29,69 @@ def extract_response(message: Any) -> str:
     return content
 
 
+def _is_non_retriable_llm_error(error_text: str) -> bool:
+    """Return True for configuration/auth errors that should fail fast."""
+    hard_fail_markers = [
+        "incorrect api key",
+        "invalid api key",
+        "authentication",
+        "unauthorized",
+        "permission denied",
+        "model not found",
+        "no such model",
+        "invalid_request_error",
+        "unsupported parameter",
+    ]
+    return any(marker in error_text for marker in hard_fail_markers)
+
+
+async def _call_with_persistent_retries(agent: Any, request_fn, stage_label: str) -> tuple[Any, int]:
+    """Keep retrying retriable LLM calls until success or manual interruption.
+
+    Returns:
+        (response, retry_attempts)
+    """
+    loop = asyncio.get_event_loop()
+    retry_attempts = 0
+
+    while True:
+        try:
+            response = await loop.run_in_executor(None, request_fn)
+            if response is not None and getattr(response, "choices", None):
+                return response, retry_attempts
+
+            retry_attempts += 1
+            print(
+                f"[!] {stage_label} LLM API 异常响应，第 {retry_attempts} 次重连尝试中... (5s 后重试)",
+                file=sys.stdout,
+                flush=True,
+            )
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            raise
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            error_text = str(exc).lower()
+            if _is_non_retriable_llm_error(error_text):
+                raise
+
+            retry_attempts += 1
+            print(
+                f"[!] {stage_label} LLM 连接异常，第 {retry_attempts} 次重连尝试中... ({exc})",
+                file=sys.stdout,
+                flush=True,
+            )
+            await asyncio.sleep(5)
+
+
+def _prepend_retry_notice(text: str, retry_attempts: int) -> str:
+    """Annotate a successful response if retries happened within the same round."""
+    if retry_attempts <= 0:
+        return text
+    return f"[LLM恢复] 本轮在第 {retry_attempts} 次重连后恢复。\n{text}"
+
+
 async def call_llm(agent: Any, system_prompt: str) -> str:
     """Call the LLM with the current context and system prompt (single turn)."""
     client = agent._get_client()
@@ -50,16 +114,16 @@ async def call_llm(agent: Any, system_prompt: str) -> str:
         kwargs["reasoning_effort"] = agent.config.llm.reasoning_effort
         kwargs.pop("temperature", None)
 
-    loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(None, lambda: client.chat.completions.create(**kwargs))
-
-    if response is None or not response.choices:
-        return "[!] LLM API 异常响应（配额耗尽/限流/网络错误），请稍后重试"
+    response, retry_attempts = await _call_with_persistent_retries(
+        agent,
+        lambda: client.chat.completions.create(**kwargs),
+        "单轮",
+    )
 
     choice = response.choices[0]
     if choice.message.tool_calls:
-        return await handle_tool_calls(agent, choice.message)
-    return extract_response(choice.message)
+        return _prepend_retry_notice(await handle_tool_calls(agent, choice.message), retry_attempts)
+    return _prepend_retry_notice(extract_response(choice.message), retry_attempts)
 
 
 async def call_llm_auto(agent: Any, system_prompt: str, round_context: str) -> str:
@@ -85,22 +149,11 @@ async def call_llm_auto(agent: Any, system_prompt: str, round_context: str) -> s
         kwargs["reasoning_effort"] = agent.config.llm.reasoning_effort
         kwargs.pop("temperature", None)
 
-    loop = asyncio.get_event_loop()
-    response = None
-    for attempt in range(3):
-        try:
-            response = await loop.run_in_executor(None, lambda: client.chat.completions.create(**kwargs))
-            break
-        except Exception as e:
-            err_str = str(e).lower()
-            if attempt < 2 and any(kw in err_str for kw in ["overloaded", "529", "rate limit", "timeout", "timed out", "connection"]):
-                await asyncio.sleep((attempt + 1) * 5)
-                continue
-            response = None
-            break
-
-    if response is None or not response.choices:
-        return "[!] LLM API 异常响应（配额耗尽/限流/网络错误），请稍后重试"
+    response, retry_attempts = await _call_with_persistent_retries(
+        agent,
+        lambda: client.chat.completions.create(**kwargs),
+        "自主循环",
+    )
 
     choice = response.choices[0]
     if choice.message.tool_calls:
@@ -157,13 +210,15 @@ async def call_llm_auto(agent: Any, system_prompt: str, round_context: str) -> s
 
         try:
             kwargs["messages"] = messages
-            response2 = await loop.run_in_executor(None, lambda: client.chat.completions.create(**kwargs))
-            if response2 is None or not response2.choices:
-                return "[tool results processed] 工具已执行完毕，但二次总结请求失败（API 异常），请继续分析"
+            response2, second_retry_attempts = await _call_with_persistent_retries(
+                agent,
+                lambda: client.chat.completions.create(**kwargs),
+                "工具总结",
+            )
             final_text = extract_response(response2.choices[0].message)
             agent.context.add_assistant_message(final_text)
-            return final_text
+            return _prepend_retry_notice(final_text, retry_attempts + second_retry_attempts)
         except Exception as e2:
             return f"[tool results processed] 继续分析错误: {e2}"
 
-    return extract_response(choice.message)
+    return _prepend_retry_notice(extract_response(choice.message), retry_attempts)

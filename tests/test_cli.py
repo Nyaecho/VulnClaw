@@ -68,6 +68,14 @@ class TestCLI:
         assert "知识库更新完成" in result.output
         assert (tmp_path / "index.json").exists()
 
+    def test_cli_doctor_reports_registered_tools(self, runner):
+        from vulnclaw.cli.main import app
+
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0
+        assert "Registered:" in result.output
+        assert "Tools:" in result.output
+
     def test_cli_kb_info(self, runner):
         from vulnclaw.cli.main import app
         result = runner.invoke(app, ["kb", "info"])

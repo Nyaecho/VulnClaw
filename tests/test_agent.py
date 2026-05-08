@@ -726,6 +726,83 @@ class TestAgentCoreLoop:
         assert result == "ok"
 
     @pytest.mark.asyncio
+    async def test_llm_client_call_llm_auto_retries_within_same_round(self, monkeypatch):
+        from vulnclaw.agent import llm_client
+
+        class DummyLoop:
+            def __init__(self):
+                self.calls = 0
+
+            async def run_in_executor(self, executor, fn):
+                self.calls += 1
+                if self.calls < 3:
+                    raise RuntimeError("connection error")
+
+                class Msg:
+                    content = "恢复成功"
+                    tool_calls = None
+
+                class Choice:
+                    message = Msg()
+
+                class Resp:
+                    choices = [Choice()]
+
+                return Resp()
+
+        class DummyAgent:
+            class _DummyClient:
+                class _Chat:
+                    class _Completions:
+                        def create(self, **kwargs):
+                            return None
+
+                    completions = _Completions()
+
+                chat = _Chat()
+
+            class _DummyConfig:
+                class _DummyLLM:
+                    model = "gpt-4o-mini"
+                    max_tokens = 256
+                    temperature = 0.1
+                    provider = "openai"
+                    reasoning_effort = "high"
+
+                llm = _DummyLLM()
+
+            class _DummyContext:
+                @staticmethod
+                def get_messages():
+                    return []
+
+                @staticmethod
+                def add_assistant_message(text):
+                    return None
+
+            config = _DummyConfig()
+            context = _DummyContext()
+
+            def _build_openai_tools(self):
+                return []
+
+            def _get_client(self):
+                return self._DummyClient()
+
+        loop = DummyLoop()
+        dummy = DummyAgent()
+        monkeypatch.setattr(llm_client.asyncio, "get_event_loop", lambda: loop)
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr(llm_client.asyncio, "sleep", no_sleep)
+        result = await llm_client.call_llm_auto(dummy, "sys", "round")
+        assert "LLM恢复" in result
+        assert "恢复成功" in result
+        assert loop.calls == 3
+
+    @pytest.mark.asyncio
     async def test_auto_pentest_stops_on_done_signal(self, monkeypatch):
         agent = self._make_agent()
         from vulnclaw.agent import loop_controller
